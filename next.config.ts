@@ -1,7 +1,12 @@
 import type { NextConfig } from "next";
 
+const isProd = process.env.NODE_ENV === 'production';
+
 const nextConfig: NextConfig = {
-  output: 'export',  // Static HTML export for Firebase Hosting
+  output: 'export',
+  basePath: isProd ? '/medsyn-landing' : '',
+  assetPrefix: isProd ? '/medsyn-landing/' : '',
+  images: { unoptimized: true },
 };
 
 export default nextConfig;
