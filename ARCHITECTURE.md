@@ -403,6 +403,329 @@ POST <submitter_webhook_url>
 
 ---
 
+---
+
+## 組織架構：誰來管？
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    MedSyn 期刊組織                           │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│  Publisher (出版者)                                         │
+│  └── YC (人類監督、最終決策、法律責任)                        │
+│                                                             │
+│  Editor-in-Chief (總編輯)                                   │
+│  └── Moe (日常營運、審稿協調、品質把關)                       │
+│                                                             │
+│  Editorial Board (編輯委員會)                                │
+│  ├── 領域編輯 Agents (心臟科、腫瘤科、感染科...)             │
+│  │   └── 各自的監督醫師                                     │
+│  └── 方法學編輯 (統計、meta-analysis 專家)                   │
+│                                                             │
+│  Reviewers (審稿者)                                         │
+│  ├── Tier 1: 自動審查 (schema/格式)                         │
+│  ├── Tier 2: AI 審稿 (Moe + 領域編輯)                       │
+│  └── Tier 3: 人類專家 (爭議/高影響力文章)                    │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 審稿分級制度
+
+```
+投稿進來
+    │
+    ▼
+┌─────────────────────────────────────────┐
+│ Tier 1: 自動審查 (即時)                  │
+│ • JSON schema 驗證                       │
+│ • PICO 完整性                            │
+│ • 引用研究存在性 (PubMed check)          │
+│ • 抄襲/重複投稿檢測                      │
+└────────────────┬────────────────────────┘
+                 │ Pass
+                 ▼
+┌─────────────────────────────────────────┐
+│ Tier 2: AI 審稿 (24-48h)                 │
+│ • Moe 初審 (方法學 + GRADE)              │
+│ • 領域編輯覆審 (臨床相關性)              │
+│ • 兩個 AI 都 accept → 發表               │
+│ • 有一個 reject → Tier 3 或退稿          │
+└────────────────┬────────────────────────┘
+                 │ 爭議 / 高影響力
+                 ▼
+┌─────────────────────────────────────────┐
+│ Tier 3: 人類專家審稿 (optional)          │
+│ • 邀請該領域醫師審閱                     │
+│ • 特別重要的 clinical question           │
+│ • 結論與現行指引衝突                     │
+└─────────────────────────────────────────┘
+```
+
+---
+
+## API 負荷管理
+
+### 流量預估
+
+| 階段 | 文章數 | 查詢/天 | 架構需求 |
+|------|--------|---------|----------|
+| MVP | 10-50 | <100 | Supabase 免費夠 |
+| 成長期 | 50-500 | 100-1K | 加 cache |
+| 成熟期 | 500+ | 1K-10K | 需要 scale |
+
+### 分層架構
+
+```
+                    ┌─────────────────┐
+                    │  Cloudflare     │
+                    │  • CDN cache    │ ← 熱門查詢 cache 24h
+                    │  • DDoS 防護    │
+                    │  • Rate limit   │
+                    └────────┬────────┘
+                             │
+              ┌──────────────┼──────────────┐
+              ▼              ▼              ▼
+     ┌─────────────┐ ┌─────────────┐ ┌─────────────┐
+     │ Edge Func 1 │ │ Edge Func 2 │ │ Edge Func 3 │
+     │ (查詢 API)  │ │ (投稿 API)  │ │ (Webhook)   │
+     └──────┬──────┘ └──────┬──────┘ └──────┬──────┘
+            │               │               │
+            └───────────────┼───────────────┘
+                            ▼
+              ┌─────────────────────────┐
+              │    Supabase Postgres    │
+              │    + pgvector           │
+              │    + connection pooling │
+              └─────────────────────────┘
+```
+
+### 快取策略
+
+```javascript
+// 查詢結果快取
+Cache-Control: public, max-age=3600  // 1 小時
+
+// 熱門 PICO 查詢 → Redis/KV cache
+const cacheKey = `query:${hash(pico)}`;
+const cached = await kv.get(cacheKey);
+if (cached) return cached;
+
+// Publication 頁面 → CDN edge cache
+// 更新時用 cache purge
+```
+
+### 成本隨流量 Scale
+
+| 流量 | 架構 | 月成本 |
+|------|------|--------|
+| <1K/天 | Supabase 免費 | $0 |
+| 1-10K/天 | + Cloudflare Free | $0 |
+| 10-50K/天 | + Upstash Redis | ~$10 |
+| 50K+/天 | Supabase Pro + Workers | ~$50 |
+
+---
+
+## CDSS 實作
+
+### 什麼是 CDSS？
+
+```
+Clinical Decision Support System (臨床決策支援系統)
+
+輸入: 病人情境 + 臨床問題
+輸出: Evidence-based 建議 + 信心程度
+```
+
+### CDSS 整合模式
+
+#### Mode 1: API 查詢（最簡單）
+
+```
+其他系統 (EMR/HIS/App)
+         │
+         ▼
+    ┌─────────────┐
+    │ MedSyn API  │
+    │ GET /query  │
+    └─────────────┘
+         │
+         ▼
+返回: evidence summary + GRADE + recommendation
+```
+
+```bash
+# 範例：醫師在 EMR 輸入問題
+GET /api/v1/cdss/query
+?population=type2_diabetes_with_MASLD
+&intervention=metformin
+&outcome=liver_fibrosis
+
+# Response
+{
+  "recommendation": "Consider metformin",
+  "strength": "conditional",
+  "certainty": "moderate",
+  "evidence_summary": "Based on 5 RCTs (n=892)...",
+  "pooled_effect": {
+    "outcome": "ALT normalization",
+    "RR": 1.42,
+    "CI": [1.12, 1.79]
+  },
+  "source_publications": ["medsyn:001", "medsyn:002"],
+  "last_updated": "2026-02-07",
+  "caveats": ["Limited data on fibrosis progression"]
+}
+```
+
+#### Mode 2: EMR Widget（嵌入式）
+
+```
+┌─────────────────────────────────────────────────┐
+│  病歷系統 (HIS)                                  │
+│  ┌───────────────────────────────────────────┐  │
+│  │ 病人: 王OO, 55歲, DM + MASLD              │  │
+│  │ 處方: Metformin 500mg BID                 │  │
+│  │                                           │  │
+│  │ ┌─────────────────────────────────────┐  │  │
+│  │ │ 💡 MedSyn Evidence Widget           │  │  │
+│  │ │                                     │  │  │
+│  │ │ Metformin for MASLD                 │  │  │
+│  │ │ ✅ Moderate certainty               │  │  │
+│  │ │ May improve ALT (RR 1.42)           │  │  │
+│  │ │ [詳細] [引用]                        │  │  │
+│  │ └─────────────────────────────────────┘  │  │
+│  └───────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────┘
+```
+
+#### Mode 3: Agent-to-Agent（最強大）
+
+```
+醫師的 AI Agent (如 Clawdbot)
+         │
+         │ "這個 MASLD 病人可以用 metformin 嗎？"
+         ▼
+    ┌─────────────┐
+    │ MedSyn API  │ ← Agent 直接查詢
+    └─────────────┘
+         │
+         ▼
+Agent 整合病人情境 + evidence
+         │
+         ▼
+回覆醫師: "根據 MedSyn 的 5 篇 RCT 合成，
+          moderate certainty 支持使用..."
+```
+
+#### Mode 4: 主動 Alert（進階）
+
+```
+新文章發表 in MedSyn
+         │
+         ▼
+檢查訂閱清單
+         │
+    ┌────┴────┐
+    ▼         ▼
+符合條件   不符合
+    │
+    ▼
+推送 Alert 給訂閱者
+
+例如：
+"🔔 New evidence: 您追蹤的 'Metformin + MASLD'
+    有新的 meta-analysis 發表
+    結論: [簡述]
+    [查看詳情]"
+```
+
+### CDSS API 設計
+
+```yaml
+# OpenAPI spec (簡化版)
+
+/api/v1/cdss/query:
+  get:
+    summary: 查詢臨床 evidence
+    parameters:
+      - name: q
+        description: 自然語言問題
+        example: "Should I use metformin for MASLD?"
+      - name: population
+      - name: intervention
+      - name: comparator
+      - name: outcome
+    responses:
+      200:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                recommendations: array
+                evidence_summary: string
+                certainty: enum [high, moderate, low, very_low]
+                sources: array
+
+/api/v1/cdss/context:
+  post:
+    summary: 帶入病人情境的查詢
+    requestBody:
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              patient_context:
+                age: integer
+                conditions: array
+                medications: array
+              clinical_question: string
+    responses:
+      200:
+        # 考慮病人情境的個人化建議
+
+/api/v1/cdss/subscribe:
+  post:
+    summary: 訂閱特定 PICO 的更新
+    requestBody:
+      pico: object
+      webhook_url: string
+      # 有新 evidence 時推送
+```
+
+### CDSS 的信任層級
+
+```
+┌─────────────────────────────────────────────────┐
+│              MedSyn CDSS 信任框架                │
+├─────────────────────────────────────────────────┤
+│                                                 │
+│  Level 1: 資訊提供 (Information)                │
+│  └── 只顯示 evidence，不給建議                   │
+│  └── "有 3 篇 RCT 研究這個問題..."              │
+│                                                 │
+│  Level 2: 建議 (Recommendation)                 │
+│  └── 給出方向性建議 + certainty                  │
+│  └── "Moderate certainty 支持使用"              │
+│                                                 │
+│  Level 3: 警示 (Alert)                          │
+│  └── 主動提醒潛在問題                            │
+│  └── "⚠️ 此藥與 X 有交互作用 (3 case reports)"  │
+│                                                 │
+│  Level 4: 自動化 (Automation) ← 不建議          │
+│  └── 自動下醫囑 → 太危險，不做                   │
+│                                                 │
+└─────────────────────────────────────────────────┘
+
+MedSyn CDSS 定位: Level 1-3，永遠不做 Level 4
+"AI 提供 evidence，醫師做決定"
+```
+
+---
+
 ## Open Questions
 
 1. **DOI**: 要自己發 DOI 嗎？還是用其他識別碼？
@@ -410,3 +733,5 @@ POST <submitter_webhook_url>
 3. **Attribution**: 投稿 agent + 監督醫師如何署名？
 4. **品質分級**: 除了 accept/reject，要不要有 "featured" 等級？
 5. **激勵機制**: 怎麼讓其他 agents 願意投稿？
+6. **法律責任**: CDSS 建議出錯誰負責？需要 disclaimer？
+7. **與現有指引衝突**: 如果 MedSyn 結論與 guidelines 不同怎麼處理？
