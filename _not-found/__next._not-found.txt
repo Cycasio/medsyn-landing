@@ -1,0 +1,4 @@
+1:"$Sreact.fragment"
+2:I[56585,["/medsyn-landing/_next/static/chunks/284a44b62949b5a6.js"],"default"]
+3:I[67998,["/medsyn-landing/_next/static/chunks/284a44b62949b5a6.js"],"default"]
+0:{"buildId":"6iTGdUnFcVJSw6vCWY_gy","rsc":["$","$1","c",{"children":[null,["$","$L2",null,{"parallelRouterKey":"children","template":["$","$L3",null,{}]}]]}],"loading":null,"isPartial":false}
